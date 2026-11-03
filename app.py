@@ -1,34 +1,39 @@
 """
 inferenceport-proxy — OpenAI-compatible reverse proxy for InferencePort AI
 (free multimodal API from sharktide-lightning.hf.space)
-
-No registration, no API key required upstream. Supports:
-  - Text chat (OpenAI-compatible, SSE streaming)
-  - Image generation (b64_json)
-  - Video generation (sync + async job + MP4 download)
-  - Audio / 3D (passthrough)
-
-Design: direct connection to the upstream with bounded retries.
-Optional Bearer token auth for your own deployment.
+...
 """
 import asyncio, json, os, time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 UPSTREAM = os.environ.get("UPSTREAM_URL", "https://sharktide-lightning.hf.space").rstrip("/")
-RETRIES = int(os.environ.get("RETRIES", "3"))                       # retry count for transient errors
+RETRIES = int(os.environ.get("RETRIES", "3"))
 CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "8"))
-READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "600"))         # sync video can take minutes
+READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "600"))
 CHAT_READ_TIMEOUT = float(os.environ.get("CHAT_READ_TIMEOUT", "120"))
-MODEL_CACHE_TTL = int(os.environ.get("MODEL_CACHE_TTL", "300"))     # seconds
-TOKEN = os.environ.get("PROXY_TOKEN", "")                           # optional; empty = open access
+MODEL_CACHE_TTL = int(os.environ.get("MODEL_CACHE_TTL", "300"))
+TOKEN = os.environ.get("PROXY_TOKEN", "")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 app = FastAPI(title="inferenceport-proxy")
 
+# --- CORS: must be added immediately after creating the app ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://veo1.onrender.com",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ---------- model cache ----------
+
 model_cache = {"ts": 0.0, "data": None}
 models_lock = asyncio.Lock()
 
@@ -46,7 +51,10 @@ async def fetch_models():
         if model_cache["data"] and (time.time() - model_cache["ts"]) < MODEL_CACHE_TTL:
             return model_cache["data"]
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=CONNECT_TIMEOUT), trust_env=False) as c:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(20, connect=CONNECT_TIMEOUT),
+                trust_env=False,
+            ) as c:
                 r = await c.get(f"{UPSTREAM}/gen/models", headers={"User-Agent": UA})
                 if r.status_code == 200:
                     model_cache["data"] = r.json()
@@ -64,7 +72,10 @@ async def upstream_call(path: str, method: str, body: bytes = None, params=None,
     last = None
     for attempt in range(RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=CONNECT_TIMEOUT), trust_env=False) as c:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(read_timeout, connect=CONNECT_TIMEOUT),
+                trust_env=False,
+            ) as c:
                 r = await c.request(method, url, content=body, params=params, headers=headers)
                 if r.status_code in (200, 201, 202):
                     return r.status_code, r.headers, r.content
@@ -78,7 +89,9 @@ async def upstream_call(path: str, method: str, body: bytes = None, params=None,
             await asyncio.sleep(0.8 * (attempt + 1))
     if last is not None:
         return last.status_code, last.headers, last.content
-    return 502, None, json.dumps({"error": {"message": "upstream unreachable", "type": "upstream_error"}}).encode()
+    return 502, None, json.dumps(
+        {"error": {"message": "upstream unreachable", "type": "upstream_error"}}
+    ).encode()
 
 
 def filter_headers(h) -> dict:
@@ -125,32 +138,45 @@ async def chat(request: Request):
         payload = json.loads(body)
     except Exception:
         return JSONResponse({"error": {"message": "invalid json"}}, status_code=400)
+
     stream = bool(payload.get("stream", False))
     url = f"{UPSTREAM}/gen/chat/completions"
-    headers = {"User-Agent": UA, "Content-Type": "application/json",
-               "Accept": "text/event-stream" if stream else "application/json"}
+    headers = {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
+    }
 
     last = None
     for attempt in range(RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(CHAT_READ_TIMEOUT, connect=CONNECT_TIMEOUT), trust_env=False) as c:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(CHAT_READ_TIMEOUT, connect=CONNECT_TIMEOUT),
+                trust_env=False,
+            ) as c:
                 r = await c.post(url, content=body, headers=headers)
                 if r.status_code not in (429, 500, 502, 503, 504):
                     resp_headers = filter_headers(r.headers)
                     resp_headers["X-Route"] = "direct"
+
                     if stream:
                         async def gen():
-                            async with httpx.AsyncClient(timeout=httpx.Timeout(CHAT_READ_TIMEOUT, connect=CONNECT_TIMEOUT), trust_env=False) as c2:
+                            async with httpx.AsyncClient(
+                                timeout=httpx.Timeout(CHAT_READ_TIMEOUT, connect=CONNECT_TIMEOUT),
+                                trust_env=False,
+                            ) as c2:
                                 async with c2.stream("POST", url, content=body, headers=headers) as sr:
                                     async for chunk in sr.aiter_bytes():
                                         yield chunk
                         return StreamingResponse(gen(), media_type="text/event-stream", headers=resp_headers)
+
                     return JSONResponse(json.loads(r.content), headers=resp_headers)
                 last = r
         except Exception as e:
             print(f"[chat] attempt {attempt}: {type(e).__name__} {str(e)[:100]}", flush=True)
         if attempt < RETRIES - 1:
             await asyncio.sleep(0.8 * (attempt + 1))
+
     if last is not None:
         return JSONResponse(json.loads(last.content), status_code=last.status_code)
     return JSONResponse({"error": {"message": "upstream unreachable"}}, status_code=502)
@@ -210,7 +236,10 @@ async def videos_async_content(request: Request, video_id: str):
 
     for attempt in range(RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=CONNECT_TIMEOUT), trust_env=False) as c:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(300, connect=CONNECT_TIMEOUT),
+                trust_env=False,
+            ) as c:
                 r = await c.get(url, headers=headers)
                 if r.status_code == 303:
                     loc = r.headers.get("location", "")
@@ -219,8 +248,14 @@ async def videos_async_content(request: Request, video_id: str):
                     return await stream_video_file(loc)
                 if r.status_code == 200:
                     mt = r.headers.get("content-type", "video/mp4")
-                    return StreamingResponse(iter([r.content]), media_type=mt,
-                                             headers={"X-Route": "direct", "Content-Disposition": f'attachment; filename="{video_id}.mp4"'})
+                    return StreamingResponse(
+                        iter([r.content]),
+                        media_type=mt,
+                        headers={
+                            "X-Route": "direct",
+                            "Content-Disposition": f'attachment; filename="{video_id}.mp4"',
+                        },
+                    )
                 if r.status_code == 202:
                     return JSONResponse({"status": "processing", "message": "video not ready yet"}, status_code=202)
                 if r.status_code not in (429, 500, 502, 503, 504):
@@ -239,8 +274,14 @@ async def stream_video_file(loc: str):
             r = await c.get(loc, headers={"User-Agent": UA})
             if r.status_code == 200:
                 mt = r.headers.get("content-type", "video/mp4")
-                return StreamingResponse(iter([r.content]), media_type=mt,
-                                         headers={"X-Route": "direct", "Content-Disposition": 'attachment; filename="video.mp4"'})
+                return StreamingResponse(
+                    iter([r.content]),
+                    media_type=mt,
+                    headers={
+                        "X-Route": "direct",
+                        "Content-Disposition": 'attachment; filename="video.mp4"',
+                    },
+                )
             return JSONResponse({"error": {"message": f"asset fetch failed: {r.status_code}"}}, status_code=r.status_code)
     except Exception as e:
         print(f"[video-asset] {type(e).__name__} {str(e)[:100]}", flush=True)
